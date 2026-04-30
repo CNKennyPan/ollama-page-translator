@@ -19,7 +19,7 @@ const SKIP_TAGS = new Set([
   'NOSCRIPT', 'IFRAME', 'OBJECT', 'EMBED',
 ]);
 
-const CHUNK_SIZE = 8;
+const CHUNK_SIZE = 32;
 
 // --- Text node extraction ---
 
@@ -166,29 +166,49 @@ async function translatePage(sourceLang, targetLang) {
       return;
     }
 
-    // 2. Split into chunks
-    const chunks = chunkArray(allNodes, CHUNK_SIZE);
+    // 2. Deduplicate: group nodes by identical text to translate once
+    const textToNodes = new Map();
+    for (const item of allNodes) {
+      if (!textToNodes.has(item.text)) textToNodes.set(item.text, []);
+      textToNodes.get(item.text).push(item);
+    }
+    const uniqueTexts = Array.from(textToNodes.keys());
+    const chunks = chunkArray(uniqueTexts, CHUNK_SIZE);
     let translatedCount = 0;
 
     // 3. Translate each chunk serially
     for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const texts = chunk.map(n => n.text);
+      const chunkTexts = chunks[i];
 
       try {
-        const translations = await translateChunk(texts, sourceLang, targetLang);
-        const applied = applyTranslations(chunk, translations);
-        translatedCount += applied;
+        const translations = await translateChunk(chunkTexts, sourceLang, targetLang);
+
+        // Apply to all nodes that share each original text
+        for (let j = 0; j < chunkTexts.length && j < translations.length; j++) {
+          const originalText = chunkTexts[j];
+          const translated = (translations[j] || '').trim();
+          if (!translated || translated === originalText) continue;
+
+          const nodes = textToNodes.get(originalText);
+          for (const { node } of nodes) {
+            const parent = node.parentElement;
+            if (!parent) continue;
+            parent.setAttribute('data-original', parent.getAttribute('data-original') || originalText);
+            parent.setAttribute('data-translated', '1');
+            node.textContent = translated;
+            translatedCount++;
+          }
+        }
       } catch (err) {
         console.warn(`[Ollama Translator] Chunk ${i + 1}/${chunks.length} failed:`, err.message);
         // Continue with remaining chunks
       }
 
-      // Report progress
-      const processed = Math.min((i + 1) * CHUNK_SIZE, totalNodes);
+      // Report progress (scaled by total nodes for user perception)
+      const processed = Math.min(((i + 1) / chunks.length) * totalNodes, totalNodes);
       chrome.runtime.sendMessage({
         action: 'translation-progress',
-        current: processed,
+        current: Math.round(processed),
         total: totalNodes,
       });
     }
