@@ -12,6 +12,16 @@ window.__ollamaTranslatorLoaded = true;
 let isTranslating = false;
 let totalNodes = 0;
 
+// Translation log entry collector (sent to service worker on completion)
+const pendingLog = { errors: [] };
+
+// Auto-translate state (MutationObserver for dynamic content)
+let autoTranslateLang = null;
+let mutationObserver = null;
+let autoTranslateDebounce = null;
+let isAutoTranslating = false;
+let warmupDone = false;
+
 // --- Skip these elements entirely ---
 const SKIP_TAGS = new Set([
   'SCRIPT', 'STYLE', 'SVG', 'CANVAS', 'VIDEO', 'AUDIO',
@@ -85,12 +95,30 @@ function chunkArray(arr, size) {
 /**
  * Send text chunk to background service worker and get translations.
  * Includes a timeout so the page doesn't hang forever.
+ * On failure, retries once with a longer timeout.
  */
-async function translateChunk(texts, sourceLang, targetLang, timeoutMs = 60000) {
+async function translateChunk(texts, sourceLang, targetLang, timeoutMs = 120000) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await _translateChunkOnce(texts, sourceLang, targetLang, timeoutMs * attempt);
+    } catch (err) {
+      if (attempt === 2) throw err; // both attempts failed
+      console.warn(`[Ollama Translator] Retrying chunk after: ${err.message}`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+}
+
+async function _translateChunkOnce(texts, sourceLang, targetLang, timeoutMs) {
   return new Promise((resolve, reject) => {
+    // Service worker uses timeoutMs for the fetch AbortSignal.
+    // We add 5s buffer so the service worker's fetch times out first
+    // and returns a clean error, rather than us timing out and
+    // leaving the fetch dangling.
+    const safetyTimeout = timeoutMs + 5000;
     const timer = setTimeout(() => {
-      reject(new Error('翻译请求超时，请检查 Ollama 是否运行'));
-    }, timeoutMs);
+      reject(new Error(`翻译请求超时 (${timeoutMs/1000}秒)，请检查 Ollama 是否运行或增大超时设置`));
+    }, safetyTimeout);
 
     chrome.runtime.sendMessage(
       {
@@ -98,6 +126,7 @@ async function translateChunk(texts, sourceLang, targetLang, timeoutMs = 60000) 
         texts,
         sourceLang,
         targetLang,
+        timeoutMs,  // pass to service worker so fetch timeout matches
       },
       (response) => {
         clearTimeout(timer);
@@ -111,6 +140,22 @@ async function translateChunk(texts, sourceLang, targetLang, timeoutMs = 60000) 
       }
     );
   });
+}
+
+/**
+ * Warm up the model by sending a tiny request to Ollama.
+ * This ensures the model is loaded in memory before we start translating chunks.
+ * Only runs once per page session.
+ */
+async function warmupModel() {
+  if (warmupDone) return;
+  warmupDone = true;
+  try {
+    await chrome.runtime.sendMessage({ action: 'warmup-model' });
+  } catch (err) {
+    // Non-fatal — translation may still succeed if model is already loaded
+    console.warn('[Ollama Translator] Model warmup failed:', err.message);
+  }
 }
 
 /**
@@ -144,6 +189,12 @@ async function translatePage(sourceLang, targetLang) {
   if (isTranslating) return;
   isTranslating = true;
 
+  // Reset log for this session
+  pendingLog.errors = [];
+  pendingLog.sourceLang = sourceLang;
+  pendingLog.targetLang = targetLang;
+  pendingLog.timestamp = Date.now();
+
   // Notify popup: starting
   chrome.runtime.sendMessage({
     action: 'translation-status',
@@ -151,9 +202,20 @@ async function translatePage(sourceLang, targetLang) {
   });
 
   try {
+    // Strip all data-translated markers so lazy-loaded content under
+    // previously marked parents can be collected on re-translate.
+    document.querySelectorAll('[data-translated]').forEach((el) => {
+      el.removeAttribute('data-translated');
+    });
+
+    // Warm up the model on first translation so model loading time
+    // doesn't count against the first chunk's timeout.
+    await warmupModel();
+
     // 1. Collect text nodes
     const allNodes = collectTextNodes();
     totalNodes = allNodes.length;
+    pendingLog.totalNodes = totalNodes;
 
     if (totalNodes === 0) {
       chrome.runtime.sendMessage({
@@ -201,6 +263,7 @@ async function translatePage(sourceLang, targetLang) {
         }
       } catch (err) {
         console.warn(`[Ollama Translator] Chunk ${i + 1}/${chunks.length} failed:`, err.message);
+        pendingLog.errors.push(`Chunk ${i + 1}: ${err.message}`);
         // Continue with remaining chunks
       }
 
@@ -213,14 +276,26 @@ async function translatePage(sourceLang, targetLang) {
       });
     }
 
-    // 4. Done
+    // 4. Done — send translation log to service worker
+    pendingLog.translatedCount = translatedCount;
+    pendingLog.url = window.location.href;
+
+    chrome.runtime.sendMessage({
+      action: 'save-translation-log',
+      log: { ...pendingLog },
+    });
+
     chrome.runtime.sendMessage({
       action: 'translation-status',
       status: 'completed',
       total: totalNodes,
       translated: translatedCount,
     });
+
+    // Set up MutationObserver to auto-translate dynamically added content
+    setupAutoTranslate(sourceLang, targetLang);
   } catch (err) {
+    pendingLog.errors.push(err.message);
     chrome.runtime.sendMessage({
       action: 'translation-status',
       status: 'error',
@@ -251,6 +326,137 @@ function restorePage() {
   return count;
 }
 
+// --- MutationObserver for dynamic content ---
+
+/**
+ * Set up MutationObserver to auto-translate dynamically added content
+ * (e.g. live news feeds, infinite scroll, SPAs).
+ */
+function setupAutoTranslate(sourceLang, targetLang) {
+  autoTranslateLang = { sourceLang, targetLang };
+
+  if (mutationObserver) mutationObserver.disconnect();
+
+  mutationObserver = new MutationObserver((mutations) => {
+    const addedElements = [];
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          if (node.hasAttribute('data-translated')) continue;
+          if (SKIP_TAGS.has(node.tagName)) continue;
+          if (node.textContent.trim().length >= 2) {
+            addedElements.push(node);
+          }
+        }
+      }
+    }
+
+    if (addedElements.length === 0) return;
+
+    clearTimeout(autoTranslateDebounce);
+    autoTranslateDebounce = setTimeout(() => {
+      translateNewNodes(addedElements);
+    }, 1500);
+  });
+
+  mutationObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+  });
+}
+
+/**
+ * Stop MutationObserver (called on restore or manual disable).
+ */
+function stopAutoTranslate() {
+  if (mutationObserver) {
+    mutationObserver.disconnect();
+    mutationObserver = null;
+  }
+  autoTranslateLang = null;
+  clearTimeout(autoTranslateDebounce);
+}
+
+/**
+ * Translate text nodes within newly added DOM elements.
+ */
+async function translateNewNodes(roots) {
+  if (!autoTranslateLang || isAutoTranslating) return;
+  isAutoTranslating = true;
+
+  try {
+    // Collect translatable text nodes from all new root elements
+    const allNodes = [];
+    let id = 0;
+
+    for (const root of roots) {
+      const walker = document.createTreeWalker(
+        root,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode: (node) => {
+            const parent = node.parentElement;
+            if (!parent) return NodeFilter.FILTER_REJECT;
+            if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
+            if (parent.hasAttribute('data-translated')) return NodeFilter.FILTER_REJECT;
+            const text = node.textContent.trim();
+            if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
+            if (/^[\d\s.,!?;:()\-—]+$/.test(text)) return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+          },
+        }
+      );
+
+      let node;
+      while ((node = walker.nextNode()) !== null) {
+        allNodes.push({ id: id++, text: node.textContent.trim(), node });
+      }
+    }
+
+    if (allNodes.length === 0) return;
+
+    // Dedup
+    const textToNodes = new Map();
+    for (const item of allNodes) {
+      if (!textToNodes.has(item.text)) textToNodes.set(item.text, []);
+      textToNodes.get(item.text).push(item);
+    }
+    const uniqueTexts = Array.from(textToNodes.keys());
+    const chunks = chunkArray(uniqueTexts, CHUNK_SIZE);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkTexts = chunks[i];
+      try {
+        const translations = await translateChunk(
+          chunkTexts,
+          autoTranslateLang.sourceLang,
+          autoTranslateLang.targetLang,
+        );
+
+        for (let j = 0; j < chunkTexts.length && j < translations.length; j++) {
+          const originalText = chunkTexts[j];
+          const translated = (translations[j] || '').trim();
+          if (!translated || translated === originalText) continue;
+
+          const nodes = textToNodes.get(originalText);
+          for (const { node } of nodes) {
+            const parent = node.parentElement;
+            if (!parent) continue;
+            if (parent.hasAttribute('data-translated')) continue;
+            parent.setAttribute('data-original', parent.getAttribute('data-original') || originalText);
+            parent.setAttribute('data-translated', '1');
+            node.textContent = translated;
+          }
+        }
+      } catch (err) {
+        console.warn('[Ollama Translator] Auto-translate chunk failed:', err.message);
+      }
+    }
+  } finally {
+    isAutoTranslating = false;
+  }
+}
+
 // --- Message listener ---
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   switch (request.action) {
@@ -261,6 +467,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true; // async response
 
     case 'restore':
+      stopAutoTranslate();
       const count = restorePage();
       sendResponse({ ok: true, count });
       return false;
@@ -272,6 +479,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     case 'show-error':
       showErrorToast(request.message);
+      sendResponse({ ok: true });
+      return false;
+
+    case 'disable-auto-translate':
+      stopAutoTranslate();
       sendResponse({ ok: true });
       return false;
   }

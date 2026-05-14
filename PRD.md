@@ -182,6 +182,11 @@ Service Worker → chrome.tabs.sendMessage → Content Script
 - [x] 错误提示（Ollama 未运行等）
 - [x] 翻译进度提示
 - [x] Ollama 地址可配置
+- [x] 批处理 + 去重（32 节点/chunk，~4-10x 加速）
+- [x] 翻译日志记录 + 设置页查看器（最近 200 条，本地持久化）
+- [x] 可配置 API 超时（默认 120s，设置页可调 30-600s）
+- [x] Chunk 失败自动重试（重试一次，超时翻倍）
+- [x] 懒加载内容重新翻译（二次点击先清除 data-translated 标记）
 
 ### MVP 不包含
 - [ ] 自动语言检测

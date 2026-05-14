@@ -5,12 +5,44 @@
 // --- Cache (per page session) ---
 const translationCache = new Map();
 
+// --- Translation logs (session + persisted) ---
+const MAX_LOGS = 200;
+let translationLogs = [];
+
+async function loadLogs() {
+  try {
+    const result = await chrome.storage.local.get('translationLogs');
+    if (result.translationLogs) translationLogs = result.translationLogs.slice(-MAX_LOGS);
+  } catch { /* first run */ }
+}
+
+async function saveLogs() {
+  try {
+    // Keep only the most recent MAX_LOGS
+    const trimmed = translationLogs.slice(-MAX_LOGS);
+    await chrome.storage.local.set({ translationLogs: trimmed });
+    translationLogs = trimmed;
+  } catch { /* storage may be full — silently trim */ }
+}
+
+function addLogEntry(entry) {
+  translationLogs.push({
+    ...entry,
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  });
+  saveLogs();
+}
+
+// Load logs on startup
+loadLogs();
+
 // --- Default settings ---
 const DEFAULT_SETTINGS = {
   ollamaHost: 'http://127.0.0.1:11434',
   model: 'huihui_ai/hy-mt1.5-abliterated:1.8b',
   sourceLang: 'auto',
   targetLang: 'zh-CN',
+  timeout: 120,
 };
 
 // --- Settings access ---
@@ -32,12 +64,14 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'translate-selection' && info.selectionText) {
     const settings = await getSettings();
     try {
+      const timeoutMs = (settings.timeout || 120) * 1000;
       const translations = await callOllama(
         settings.ollamaHost,
         settings.model,
         [info.selectionText],
         settings.sourceLang,
-        settings.targetLang
+        settings.targetLang,
+        timeoutMs
       );
       if (translations && translations[0]) {
         await chrome.tabs.sendMessage(tab.id, {
@@ -60,7 +94,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
  * Call Ollama /api/chat to translate an array of texts.
  * Returns a string array of translations in the same order.
  */
-async function callOllama(host, model, texts, sourceLang, targetLang) {
+async function callOllama(host, model, texts, sourceLang, targetLang, timeoutMs) {
   const sourceText = sourceLang === 'auto' ? 'auto-detected source language' : sourceLang;
   const langPair = `${sourceText} to ${targetLang}`;
 
@@ -93,7 +127,7 @@ Example output: ["你好", "你好吗？"]`;
         items: { type: 'string' },
       },
     }),
-    signal: AbortSignal.timeout(60000),
+    signal: AbortSignal.timeout(timeoutMs || 120000),
   });
 
   if (!response.ok) {
@@ -193,9 +227,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  // --- Warm up model (load into memory before translation) ---
+  if (request.action === 'warmup-model') {
+    (async () => {
+      try {
+        const settings = await getSettings();
+        const resp = await fetch(`${settings.ollamaHost}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: settings.model,
+            messages: [{ role: 'user', content: 'test' }],
+            stream: false,
+            options: { temperature: 0.1 },
+          }),
+          signal: AbortSignal.timeout(120000),
+        });
+        if (resp.ok) {
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: `HTTP ${resp.status}` });
+        }
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
   // --- Translate a chunk of texts ---
   if (request.action === 'translate-chunk') {
-    const { texts, sourceLang, targetLang } = request;
+    const { texts, sourceLang, targetLang, timeoutMs: requestTimeout } = request;
 
     (async () => {
       // Check cache first
@@ -221,12 +283,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       try {
         const settings = await getSettings();
         const uncachedTexts = uncached.map(u => u.text);
+        // Use timeout from the request (passed by content script) if provided,
+        // otherwise fall back to settings. This ensures retry with longer
+        // timeout actually uses the longer timeout on the fetch side too.
+        const timeoutMs = requestTimeout || (settings.timeout || 120) * 1000;
         const translations = await callOllama(
           settings.ollamaHost,
           request.model || settings.model,
           uncachedTexts,
           sourceLang,
-          targetLang
+          targetLang,
+          timeoutMs
         );
 
         // Fill results and cache
@@ -245,5 +312,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     })();
 
     return true; // keep channel open
+  }
+
+  // --- Save translation log ---
+  if (request.action === 'save-translation-log') {
+    addLogEntry(request.log);
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  // --- Get translation logs ---
+  if (request.action === 'get-translation-logs') {
+    sendResponse({ ok: true, logs: translationLogs });
+    return false;
+  }
+
+  // --- Clear translation logs ---
+  if (request.action === 'clear-translation-logs') {
+    translationLogs = [];
+    chrome.storage.local.remove('translationLogs');
+    sendResponse({ ok: true });
+    return false;
   }
 });
